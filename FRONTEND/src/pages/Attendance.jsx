@@ -74,15 +74,14 @@ function getTimetableHour(row) {
 }
 
 // ─── Schedule builder ────────────────────────────────────────────────────────
-// Returns ONLY teaching periods (BREAK/FREE excluded).
+// Returns ONLY teaching periods (BREAK/FREE/LUNCH excluded).
 // Each period has:
-//   hour        – original DB column value  → used for all Supabase queries & saves
-//   displayHour – sequential UI number (1, 2, 3 …) → shown on cards, never saved
+//   hour – original DB column value → used for ALL Supabase queries, saves, AND display.
+//           NEVER renumbered. NEVER compressed. Always equals the DB row's hour column.
 function buildSchedule(timetableRows, subjects, dayName) {
   if (WEEKEND_DAYS.has(dayName)) {
     return Array.from({ length: HOUR_COUNT }, (_, i) => ({
       hour: i + 1,
-      displayHour: i + 1,
       subjectCode: "",
       subjectName: "No classes scheduled.",
       shortName: "No classes scheduled.",
@@ -98,24 +97,27 @@ function buildSchedule(timetableRows, subjects, dayName) {
     .filter((row) => isSelectedTimetableDay(row, dayName))
     .sort((a, b) => getTimetableHour(a) - getTimetableHour(b));
 
-  // Keep only actual teaching periods — discard BREAK and FREE entirely
+  // Keep only actual teaching periods — discard BREAK, FREE, and LUNCH entirely.
+  // The DB hour value is ALWAYS preserved as-is. No renumbering.
   const teachingRows = dayRows.filter((row) => {
     const code = (getValue(row, ["subject_code", "subjectCode", "code"]) || "").trim().toUpperCase();
     const name = (getValue(row, ["subject_name", "subjectName", "name"]) || "").trim().toUpperCase();
-    return !NON_ATTENDANCE_PERIODS.has(code) && !NON_ATTENDANCE_PERIODS.has(name);
+    return (
+      !NON_ATTENDANCE_PERIODS.has(code) &&
+      !NON_ATTENDANCE_PERIODS.has(name) &&
+      code !== "LUNCH" &&
+      name !== "LUNCH"
+    );
   });
 
-  // Assign sequential displayHour while preserving original DB hour
-  return teachingRows.map((row, index) => {
-    const dbHour = getTimetableHour(row);   // DB value — used in Supabase ops
-    const displayHour = index + 1;           // UI label — display only
+  return teachingRows.map((row) => {
+    const dbHour = getTimetableHour(row);   // DB value — preserved exactly for display AND Supabase
     const subjectCode = getValue(row, ["subject_code", "subjectCode", "code"]);
     const linkedSubject = subjectCode ? subjectByCode.get(subjectCode) : null;
     const subjectName = getValue(row, ["subject_name", "subjectName", "name"], getSubjectName(linkedSubject));
 
     return {
-      hour: dbHour,
-      displayHour,
+      hour: dbHour,          // This is the ONLY hour field. Same value used for display AND DB ops.
       subjectCode,
       subjectName,
       shortName: getValue(row, ["short_name", "shortName"], subjectName || subjectCode),
@@ -166,8 +168,7 @@ function Attendance() {
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [attendanceDate, setAttendanceDate] = useState(today);
-  const [selectedHour, setSelectedHour] = useState(1);         // DB hour — used for Supabase
-  const [selectedDisplayHour, setSelectedDisplayHour] = useState(1); // UI label — display only
+  const [selectedHour, setSelectedHour] = useState(1);         // DB hour — used for Supabase AND display
   const [hourAttendance, setHourAttendance] = useState({});    // regNo → "Present" | "Absent"
   const [subjectFilter, setSubjectFilter] = useState("All Subjects");
 
@@ -304,12 +305,19 @@ function Attendance() {
     setMessage("");
   }, [attendanceDate]);
 
-  // When the SCHEDULE changes → auto-select the first teaching period.
+  // When the SCHEDULE changes → auto-select the first teaching period and load its students.
   // Does NOT clear students or hourAttendance so marks survive background re-renders.
   useEffect(() => {
     const firstPeriod = daySchedule.find((p) => !p.disabled);
-    setSelectedHour(firstPeriod?.hour || 1);
-    setSelectedDisplayHour(firstPeriod?.displayHour || 1);
+    if (!firstPeriod) {
+      setSelectedHour(1);
+      return;
+    }
+    setSelectedHour(firstPeriod.hour);
+    // Auto-load students for the first period immediately.
+    // Pass the period object directly so we don't depend on stale selectedSubject state.
+    fetchStudentsForHour(firstPeriod);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [daySchedule]);
 
   // ── Actions ───────────────────────────────────────────────────────────────
@@ -598,12 +606,12 @@ function Attendance() {
                 type="button"
                 disabled={period.disabled}
                 onClick={() => {
-                  setSelectedHour(period.hour);               // store DB hour internally
-                  setSelectedDisplayHour(period.displayHour); // store UI number for display
+                  setSelectedHour(period.hour); // store DB hour — same value shown in UI
                   fetchStudentsForHour(period);
                 }}
               >
-                <span>Hour {period.displayHour}</span>
+                {/* Always display the real DB hour — never a sequential index */}
+                <span>Hour {period.hour}</span>
                 <strong>{period.shortName || "-"}</strong>
                 <small>{period.subjectCode || period.subjectName || "No subject"}</small>
               </button>
@@ -621,7 +629,8 @@ function Attendance() {
       <section className="attendance-summary-grid">
         <article className="attendance-summary-card">
           <span>Selected Hour</span>
-          <strong>Hour {selectedDisplayHour}</strong>
+          {/* selectedHour is the real DB hour — display it directly */}
+          <strong>Hour {selectedHour}</strong>
           <p>
             {selectedSubject
               ? `${selectedSubject.subjectCode} - ${selectedSubject.subjectName}`
@@ -650,7 +659,7 @@ function Attendance() {
         <div className="panel-header">
           <h3>Hour-wise Marking</h3>
           <span>
-            Hour {selectedDisplayHour} -{" "}
+            Hour {selectedHour} -{" "}
             {selectedSubject ? selectedSubject.subjectCode : "No subject"}
           </span>
         </div>
@@ -687,7 +696,7 @@ function Attendance() {
                 <tr key={record.id}>
                   <td>{record.registrationNumber}</td>
                   <td>{record.name}</td>
-                  <td>Hour {selectedDisplayHour}</td>
+                  <td>Hour {selectedHour}</td>
                   <td>
                     <strong>{selectedSubject ? selectedSubject.shortName : "-"}</strong>
                     <span className="table-subtext">
